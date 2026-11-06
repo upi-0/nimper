@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.1.0"
+version       = "0.2.0"
 author        = "upi-0"
 description   = "Nim wrapper and high-level HTTP/TLS fingerprint client for curl-impersonate (libcurl-impersonate)"
 license       = "MIT"
