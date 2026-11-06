@@ -95,6 +95,20 @@ proc runLocalTestServer(args: ServerArgs) {.thread.} =
                    "Set-Cookie: theme=dark; Path=/\r\n" &
                    "Content-Length: " & $payload.len & "\r\nConnection: close\r\n\r\n" & payload
         client.send(resp)
+      elif path == "/stream-chunks":
+        let chunk = repeat('A', 8192)
+        let totalLen = chunk.len * 8
+        let head = "HTTP/1.1 206 Partial Content\r\n" &
+                   "Content-Type: video/mp4\r\n" &
+                   "Accept-Ranges: bytes\r\n" &
+                   "Content-Range: bytes 0-" & $(totalLen - 1) & "/" & $totalLen & "\r\n" &
+                   "Content-Length: " & $totalLen & "\r\nConnection: close\r\n\r\n"
+        client.send(head)
+        for _ in 0 ..< 8:
+          try:
+            client.send(chunk)
+          except CatchableError:
+            break
       else:
         let payload = "not found"
         let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: " & $payload.len & "\r\nConnection: close\r\n\r\n" & payload
@@ -355,6 +369,55 @@ suite "nimper: High-Level HTTP Client & Session":
     let data = parseJson(r2.body)
     check data["cookie"].getStr().contains("session_id=abc123xyz")
     check data["cookie"].getStr().contains("theme=dark")
+
+  test "Streaming API (performStreaming, requestStreaming, ImpersonateShare, and early abort)":
+    let share = newImpersonateShare()
+    defer: share.close()
+
+    let session = newImpersonateSession(target = itFirefox155, share = share.handle)
+    defer: session.close()
+
+    var gotHeaders = false
+    var statusSeen = 0
+    var bytesReceived = 0
+    var req = initRequest(
+      url = baseUrl & "/stream-chunks",
+      httpMethod = "GET",
+      target = itFirefox155,
+      headers = {"Range": "bytes=0-"},
+      httpContentDecoding = false,
+      share = share.handle
+    )
+    req.acceptEncoding = "identity"
+
+    let rStream = session.requestStreaming(
+      req,
+      onHeaders = proc(head: StreamResponseHead): bool {.gcsafe.} =
+        gotHeaders = true
+        statusSeen = head.statusCode
+        return true,
+      onChunk = proc(data: pointer, len: int): bool {.gcsafe.} =
+        bytesReceived += len
+        return true
+    )
+    check gotHeaders
+    check statusSeen == 206
+    check bytesReceived == 8192 * 8
+    check not rStream.abortedByCallback
+
+    # Early abort after first chunk
+    var abortedBytes = 0
+    let rAbort = performStreaming(
+      req,
+      onHeaders = proc(head: StreamResponseHead): bool {.gcsafe.} =
+        return true,
+      onChunk = proc(data: pointer, len: int): bool {.gcsafe.} =
+        abortedBytes += len
+        return false # Abort immediately after first chunk!
+    )
+    check rAbort.abortedByCallback
+    check abortedBytes > 0
+    check abortedBytes < 8192 * 8
 
   try:
     discard get(baseUrl & "/quit", timeoutMs = 2000)

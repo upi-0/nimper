@@ -16,7 +16,7 @@
 ##   - Custom TLS / HTTP2 / HTTP3 / QUIC fingerprint overrides (`FingerprintConfig`)
 ##   - Multipart MIME form uploads (`MimePartSpec`)
 
-import std/[strutils, httpcore, tables]
+import std/[strutils, httpcore, tables, locks]
 import ./[abi, targets]
 
 type
@@ -98,6 +98,10 @@ type
     httpVersion*: abi.HTTP_VERSION
     timeoutMs*: int
     connectTimeoutMs*: int
+    lowSpeedLimit*: int
+    lowSpeedTimeSec*: int
+    bufferSize*: int
+    httpContentDecoding*: bool
     followRedirects*: bool
     safeRedirects*: bool
     maxRedirects*: int
@@ -110,6 +114,7 @@ type
     cookieFile*: string
     cookieJar*: string
     acceptEncoding*: string
+    share*: PSH
     fingerprint*: FingerprintConfig
 
   Response* = object
@@ -134,6 +139,39 @@ type
     redirectHistory*: seq[RedirectHop]
     cookies*: seq[string]
     cookieChanges*: seq[CookieChange]
+    abortedByCallback*: bool
+
+  StreamResponseHead* = object
+    ## Metadata and headers delivered to `OnHeadersCallback` as soon as the final upstream
+    ## HTTP header block is received (before body streaming begins).
+    statusCode*: int
+    httpVersion*: int
+    url*: string
+    effectiveMethod*: string
+    headers*: HttpHeaders
+    rawHeaderLines*: seq[string]
+    redirectCount*: int
+
+  OnHeadersCallback* = proc (head: StreamResponseHead): bool {.closure, gcsafe.}
+    ## Invoked once when the final HTTP response header block completes.
+    ## Return `false` to abort the transfer immediately.
+
+  OnChunkCallback* = proc (data: pointer, len: int): bool {.closure, gcsafe.}
+    ## Invoked for each chunk of response body data received from `libcurl-impersonate`.
+    ## Return `false` to abort the transfer immediately (`CURLE_WRITE_ERROR`).
+
+  OnProgressCallback* = proc (dlTotal, dlNow, ulTotal, ulNow: int64): bool {.closure, gcsafe.}
+    ## Invoked periodically by `libcurl-impersonate` (`OPT_XFERINFOFUNCTION`).
+    ## Return `false` to abort the transfer immediately (`CURLE_ABORTED_BY_CALLBACK`).
+
+  ShareLocksBlock = object
+    locks: array[ord(LOCK_DATA_LAST) + 1, Lock]
+
+  ImpersonateShareObj = object
+    handle*: PSH
+    locksPtr: ptr ShareLocksBlock
+
+  ImpersonateShare* = ref ImpersonateShareObj
 
   ImpersonateSessionObj = object
     handle*: PCurl
@@ -142,6 +180,10 @@ type
     headers*: seq[(string, string)]
     timeoutMs*: int
     connectTimeoutMs*: int
+    lowSpeedLimit*: int
+    lowSpeedTimeSec*: int
+    bufferSize*: int
+    httpContentDecoding*: bool
     followRedirects*: bool
     safeRedirects*: bool
     maxRedirects*: int
@@ -150,12 +192,26 @@ type
     cookieFile*: string
     cookieJar*: string
     httpVersion*: abi.HTTP_VERSION
+    share*: PSH
     fingerprint*: FingerprintConfig
 
   ImpersonateSession* = ref ImpersonateSessionObj
 
   BufferWrap = object
     data: string
+
+  StreamContext = object
+    curl: PCurl
+    followRedirects: bool
+    maxRedirects: int
+    headerLineBuf: string
+    headers: HttpHeaders
+    rawHeaderLines: seq[string]
+    headersDelivered: bool
+    abortedByCallback: bool
+    onHeaders: OnHeadersCallback
+    onChunk: OnChunkCallback
+    onProgress: OnProgressCallback
 
 var globalInitDone {.global.} = false
 
@@ -189,12 +245,17 @@ proc initRequest*(
   body: string = "",
   timeoutMs: int = 30_000,
   connectTimeoutMs: int = 10_000,
+  lowSpeedLimit: int = 0,
+  lowSpeedTimeSec: int = 0,
+  bufferSize: int = 0,
+  httpContentDecoding: bool = true,
   followRedirects: bool = true,
   safeRedirects: bool = false,
   maxRedirects: int = 30,
   verifySsl: bool = true,
   proxy: string = "",
-  httpVersion: abi.HTTP_VERSION = HTTP_VERSION_NONE
+  httpVersion: abi.HTTP_VERSION = HTTP_VERSION_NONE,
+  share: PSH = nil
 ): Request =
   ## Initializes a `Request` with sensible defaults for browser impersonation.
   result.url = url
@@ -209,19 +270,89 @@ proc initRequest*(
   result.httpVersion = httpVersion
   result.timeoutMs = timeoutMs
   result.connectTimeoutMs = connectTimeoutMs
+  result.lowSpeedLimit = lowSpeedLimit
+  result.lowSpeedTimeSec = lowSpeedTimeSec
+  result.bufferSize = bufferSize
+  result.httpContentDecoding = httpContentDecoding
   result.followRedirects = followRedirects
   result.safeRedirects = safeRedirects
   result.maxRedirects = maxRedirects
   result.verifySsl = verifySsl
   result.proxy = proxy
   result.acceptEncoding = "" # Empty string tells libcurl to advertise all built-in encodings (gzip, deflate, br, zstd)
+  result.share = share
   result.fingerprint = initFingerprintConfig()
 
+{.push stackTrace: off.}
+proc shareLockCallback(handle: PCurl, data: Lock_data, locktype: Lock_access, userptr: pointer) {.cdecl.} =
+  if userptr != nil and ord(data) >= 0 and ord(data) <= ord(LOCK_DATA_LAST):
+    let blk = cast[ptr ShareLocksBlock](userptr)
+    acquire(blk.locks[ord(data)])
+
+proc shareUnlockCallback(handle: PCurl, data: Lock_data, userptr: pointer) {.cdecl.} =
+  if userptr != nil and ord(data) >= 0 and ord(data) <= ord(LOCK_DATA_LAST):
+    let blk = cast[ptr ShareLocksBlock](userptr)
+    release(blk.locks[ord(data)])
+{.pop.}
+
+proc cleanupShareObj(s: var ImpersonateShareObj) =
+  if s.handle != nil:
+    discard share_cleanup(s.handle)
+    s.handle = nil
+  if s.locksPtr != nil:
+    for i in 0 .. ord(LOCK_DATA_LAST):
+      deinitLock(s.locksPtr.locks[i])
+    deallocShared(s.locksPtr)
+    s.locksPtr = nil
+
 when defined(gcDestructors):
+  proc `=destroy`(s: var ImpersonateShareObj) =
+    cleanupShareObj(s)
+
   proc `=destroy`(s: var ImpersonateSessionObj) =
     if s.handle != nil:
       easy_cleanup(s.handle)
       s.handle = nil
+
+proc close*(share: ImpersonateShare) =
+  ## Explicitly closes and cleans up the underlying `CURLSH*` handle and locks of `share`.
+  if share != nil:
+    cleanupShareObj(share[])
+
+proc newImpersonateShare*(
+  shareDns: bool = true,
+  shareSslSession: bool = true,
+  shareConnect: bool = true,
+  shareCookies: bool = false
+): ImpersonateShare =
+  ## Creates a thread-safe `ImpersonateShare` (`CURLSH*`) that allows multiple `ImpersonateSession`
+  ## or `Request` handles across worker threads to share DNS cache, TLS session tickets,
+  ## and upstream TCP/TLS connection pools.
+  ensureGlobalInit()
+  let sh = share_init()
+  if sh == nil:
+    raise newException(CurlImpersonateError, "curl_share_init returned nil")
+
+  let locksPtr = cast[ptr ShareLocksBlock](allocShared0(sizeof(ShareLocksBlock)))
+  for i in 0 .. ord(LOCK_DATA_LAST):
+    initLock(locksPtr.locks[i])
+
+  new(result)
+  result.handle = sh
+  result.locksPtr = locksPtr
+
+  discard share_setopt(sh, SHOPT_USERDATA, locksPtr)
+  discard share_setopt(sh, SHOPT_LOCKFUNC, shareLockCallback)
+  discard share_setopt(sh, SHOPT_UNLOCKFUNC, shareUnlockCallback)
+
+  if shareDns:
+    discard share_setopt(sh, SHOPT_SHARE, ord(LOCK_DATA_DNS).clong)
+  if shareSslSession:
+    discard share_setopt(sh, SHOPT_SHARE, ord(LOCK_DATA_SSL_SESSION).clong)
+  if shareConnect:
+    discard share_setopt(sh, SHOPT_SHARE, ord(LOCK_DATA_CONNECT).clong)
+  if shareCookies:
+    discard share_setopt(sh, SHOPT_SHARE, ord(LOCK_DATA_COOKIE).clong)
 
 proc close*(session: ImpersonateSession) =
   ## Explicitly closes and cleans up the underlying `CURL*` handle of `session`.
@@ -235,6 +366,10 @@ proc newImpersonateSession*(
   headers: openArray[(string, string)] = [],
   timeoutMs: int = 30_000,
   connectTimeoutMs: int = 10_000,
+  lowSpeedLimit: int = 0,
+  lowSpeedTimeSec: int = 0,
+  bufferSize: int = 0,
+  httpContentDecoding: bool = true,
   followRedirects: bool = true,
   safeRedirects: bool = false,
   maxRedirects: int = 30,
@@ -242,7 +377,8 @@ proc newImpersonateSession*(
   proxy: string = "",
   cookieFile: string = "",
   cookieJar: string = "",
-  httpVersion: abi.HTTP_VERSION = HTTP_VERSION_NONE
+  httpVersion: abi.HTTP_VERSION = HTTP_VERSION_NONE,
+  share: PSH = nil
 ): ImpersonateSession =
   ## Creates a persistent `ImpersonateSession` that keeps a live `CURL*` handle
   ## for connection pooling, TLS session resumption, DNS caching, and in-memory cookie management.
@@ -254,6 +390,8 @@ proc newImpersonateSession*(
   discard easy_setopt(h, OPT_COOKIEFILE, cookieFile.cstring)
   if cookieJar.len > 0:
     discard easy_setopt(h, OPT_COOKIEJAR, cookieJar.cstring)
+  if share != nil:
+    discard easy_setopt(h, OPT_SHARE, share)
 
   new(result)
   result.handle = h
@@ -265,6 +403,10 @@ proc newImpersonateSession*(
   result.headers = @headers
   result.timeoutMs = timeoutMs
   result.connectTimeoutMs = connectTimeoutMs
+  result.lowSpeedLimit = lowSpeedLimit
+  result.lowSpeedTimeSec = lowSpeedTimeSec
+  result.bufferSize = bufferSize
+  result.httpContentDecoding = httpContentDecoding
   result.followRedirects = followRedirects
   result.safeRedirects = safeRedirects
   result.maxRedirects = maxRedirects
@@ -273,6 +415,7 @@ proc newImpersonateSession*(
   result.cookieFile = cookieFile
   result.cookieJar = cookieJar
   result.httpVersion = httpVersion
+  result.share = share
   result.fingerprint = initFingerprintConfig()
 
 {.push stackTrace: off.}
@@ -285,6 +428,130 @@ proc writeCallback(buffer: cstring, size: int, nitems: int, outstream: pointer):
     copyMem(addr wrap.data[oldLen], buffer, total)
   result = total
 {.pop.}
+
+proc buildStreamResponseHead(ctx: var StreamContext): StreamResponseHead =
+  result.headers = newHttpHeaders()
+  if ctx.headers != nil:
+    for k, v in ctx.headers.pairs:
+      result.headers.add(k, v)
+  result.rawHeaderLines = ctx.rawHeaderLines
+
+  var respCode: clong = 0
+  if easy_getinfo(ctx.curl, INFO_RESPONSE_CODE, addr respCode) == E_OK:
+    result.statusCode = int(respCode)
+
+  var httpVer: clong = 0
+  if easy_getinfo(ctx.curl, INFO_HTTP_VERSION, addr httpVer) == E_OK:
+    result.httpVersion = int(httpVer)
+
+  var effUrl: cstring = nil
+  if easy_getinfo(ctx.curl, INFO_EFFECTIVE_URL, addr effUrl) == E_OK and effUrl != nil:
+    result.url = $effUrl
+
+  var effMethod: cstring = nil
+  if easy_getinfo(ctx.curl, INFO_EFFECTIVE_METHOD, addr effMethod) == E_OK and effMethod != nil:
+    result.effectiveMethod = $effMethod
+
+  var redirCount: clong = 0
+  if easy_getinfo(ctx.curl, INFO_REDIRECT_COUNT, addr redirCount) == E_OK:
+    result.redirectCount = int(redirCount)
+
+proc deliverHeadersIfNeeded(ctx: var StreamContext): bool =
+  if ctx.headersDelivered:
+    return true
+  ctx.headersDelivered = true
+  if ctx.onHeaders != nil:
+    let head = buildStreamResponseHead(ctx)
+    if not ctx.onHeaders(head):
+      ctx.abortedByCallback = true
+      return false
+  return true
+
+proc streamHeaderCallback(buffer: cstring, size: int, nitems: int, userdata: pointer): int {.cdecl.} =
+  let total = size * nitems
+  if total <= 0 or userdata == nil or buffer == nil:
+    return total
+  let ctx = cast[ptr StreamContext](userdata)
+  var chunk = newString(total)
+  copyMem(addr chunk[0], buffer, total)
+  ctx.headerLineBuf.add(chunk)
+
+  while true:
+    let nlPos = ctx.headerLineBuf.find('\n')
+    if nlPos < 0:
+      break
+    let rawLine = ctx.headerLineBuf[0 .. nlPos]
+    if nlPos + 1 < ctx.headerLineBuf.len:
+      ctx.headerLineBuf = ctx.headerLineBuf[nlPos + 1 .. ^1]
+    else:
+      ctx.headerLineBuf.setLen(0)
+
+    let stripped = rawLine.strip()
+    if stripped.len == 0:
+      # End of an HTTP response header block
+      var respCode: clong = 0
+      discard easy_getinfo(ctx.curl, INFO_RESPONSE_CODE, addr respCode)
+      let code = int(respCode)
+      var redirCount: clong = 0
+      discard easy_getinfo(ctx.curl, INFO_REDIRECT_COUNT, addr redirCount)
+
+      let isInformational = (code >= 100 and code < 200 and code != 101)
+      let isFollowedRedirect =
+        ctx.followRedirects and
+        code in [301, 302, 303, 307, 308] and
+        ctx.headers != nil and ctx.headers.hasKey("location") and
+        (ctx.maxRedirects < 0 or int(redirCount) < ctx.maxRedirects)
+
+      if not isInformational and not isFollowedRedirect:
+        if not deliverHeadersIfNeeded(ctx[]):
+          return 0
+    elif stripped.startsWith("HTTP/"):
+      ctx.rawHeaderLines.add(stripped)
+      if ctx.headers == nil:
+        ctx.headers = newHttpHeaders()
+      else:
+        ctx.headers.clear()
+    else:
+      ctx.rawHeaderLines.add(stripped)
+      let colonPos = stripped.find(':')
+      if colonPos > 0:
+        let key = stripped[0 ..< colonPos].strip()
+        let val = stripped[colonPos + 1 .. ^1].strip()
+        if ctx.headers == nil:
+          ctx.headers = newHttpHeaders()
+        ctx.headers.add(key, val)
+
+  result = total
+
+proc streamWriteCallback(buffer: cstring, size: int, nitems: int, outstream: pointer): int {.cdecl.} =
+  let total = size * nitems
+  if outstream == nil:
+    return total
+  let ctx = cast[ptr StreamContext](outstream)
+  if not ctx.headersDelivered:
+    if not deliverHeadersIfNeeded(ctx[]):
+      return 0
+  if total > 0 and buffer != nil and ctx.onChunk != nil:
+    if not ctx.onChunk(buffer, total):
+      ctx.abortedByCallback = true
+      return 0
+  result = total
+
+proc streamXferInfoCallback(
+  clientp: pointer,
+  dltotal: CurlOffT,
+  dlnow: CurlOffT,
+  ultotal: CurlOffT,
+  ulnow: CurlOffT
+): int32 {.cdecl.} =
+  if clientp == nil:
+    return 0
+  let ctx = cast[ptr StreamContext](clientp)
+  if ctx.onProgress != nil:
+    if not ctx.onProgress(int64(dltotal), int64(dlnow), int64(ultotal), int64(ulnow)):
+      ctx.abortedByCallback = true
+      return 1
+  return 0
 
 proc checkCode(code: Code, errBuf: cstring = nil) =
   if code != E_OK:
@@ -398,13 +665,91 @@ proc applyFingerprintConfig(curl: PCurl, fp: FingerprintConfig) =
   if fp.formBoundary.len > 0:
     checkCode easy_setopt(curl, OPT_FORM_BOUNDARY, fp.formBoundary.cstring)
 
-proc executeOnHandle(curl: PCurl, req: Request, resetFirst: bool): Response =
+proc populateResponseMetadata(curl: PCurl, result: var Response) =
+  var respCode: clong = 0
+  if easy_getinfo(curl, INFO_RESPONSE_CODE, addr respCode) == E_OK:
+    result.statusCode = int(respCode)
+
+  var effUrl: cstring = nil
+  if easy_getinfo(curl, INFO_EFFECTIVE_URL, addr effUrl) == E_OK and effUrl != nil:
+    result.url = $effUrl
+
+  var effMethod: cstring = nil
+  if easy_getinfo(curl, INFO_EFFECTIVE_METHOD, addr effMethod) == E_OK and effMethod != nil:
+    result.effectiveMethod = $effMethod
+
+  var httpVer: clong = 0
+  if easy_getinfo(curl, INFO_HTTP_VERSION, addr httpVer) == E_OK:
+    result.httpVersion = int(httpVer)
+
+  var ctype: cstring = nil
+  if easy_getinfo(curl, INFO_CONTENT_TYPE, addr ctype) == E_OK and ctype != nil:
+    result.contentType = $ctype
+
+  var primIp: cstring = nil
+  if easy_getinfo(curl, INFO_PRIMARY_IP, addr primIp) == E_OK and primIp != nil:
+    result.primaryIp = $primIp
+
+  var primPort: clong = 0
+  if easy_getinfo(curl, INFO_PRIMARY_PORT, addr primPort) == E_OK:
+    result.primaryPort = int(primPort)
+
+  discard easy_getinfo(curl, INFO_TOTAL_TIME, addr result.totalTime)
+  discard easy_getinfo(curl, INFO_NAMELOOKUP_TIME, addr result.namelookupTime)
+  discard easy_getinfo(curl, INFO_CONNECT_TIME, addr result.connectTime)
+  discard easy_getinfo(curl, INFO_APPCONNECT_TIME, addr result.appconnectTime)
+  discard easy_getinfo(curl, INFO_PRETRANSFER_TIME, addr result.pretransferTime)
+  discard easy_getinfo(curl, INFO_STARTTRANSFER_TIME, addr result.starttransferTime)
+  discard easy_getinfo(curl, INFO_REDIRECT_TIME, addr result.redirectTime)
+
+  var redirCount: clong = 0
+  if easy_getinfo(curl, INFO_REDIRECT_COUNT, addr redirCount) == E_OK:
+    result.redirectCount = int(redirCount)
+
+  # Extract curl-impersonate CURLINFO_REDIRECT_HISTORY
+  var redirSlist: Pslist = nil
+  if easy_getinfo(curl, INFO_REDIRECT_HISTORY, addr redirSlist) == E_OK and redirSlist != nil:
+    try:
+      for item in slistToSeq(redirSlist):
+        result.redirectHistory.add(parseRedirectHop(item))
+    finally:
+      slist_free_all(redirSlist)
+
+  # Extract CURLINFO_COOKIELIST
+  var cookieSlist: Pslist = nil
+  if easy_getinfo(curl, INFO_COOKIELIST, addr cookieSlist) == E_OK and cookieSlist != nil:
+    try:
+      result.cookies = slistToSeq(cookieSlist)
+    finally:
+      slist_free_all(cookieSlist)
+
+  # Extract curl-impersonate CURLINFO_COOKIECHANGES
+  var cookieChangesSlist: Pslist = nil
+  if easy_getinfo(curl, INFO_COOKIECHANGES, addr cookieChangesSlist) == E_OK and cookieChangesSlist != nil:
+    try:
+      for item in slistToSeq(cookieChangesSlist):
+        result.cookieChanges.add(parseCookieChange(item))
+    finally:
+      slist_free_all(cookieChangesSlist)
+
+proc executeOnHandle(
+  curl: PCurl,
+  req: Request,
+  resetFirst: bool,
+  streaming: bool = false,
+  onHeaders: OnHeadersCallback = nil,
+  onChunk: OnChunkCallback = nil,
+  onProgress: OnProgressCallback = nil
+): Response =
   if resetFirst:
     easy_reset(curl)
 
   var errBuf = newString(ERROR_SIZE + 1)
   discard easy_setopt(curl, OPT_ERRORBUFFER, errBuf.cstring)
   discard easy_setopt(curl, OPT_NOSIGNAL, 1.clong)
+
+  if req.share != nil:
+    checkCode(easy_setopt(curl, OPT_SHARE, req.share), errBuf.cstring)
 
   # 1. Apply HTTP version preference before impersonate so `_do_impersonate` respects `data->set.httpwant`
   if req.httpVersion != HTTP_VERSION_NONE:
@@ -427,9 +772,13 @@ proc executeOnHandle(curl: PCurl, req: Request, resetFirst: bool): Response =
   # 3. Apply fine-grained fingerprint overrides (if any)
   applyFingerprintConfig(curl, req.fingerprint)
 
-  # 4. URL & Method
+  # 4. URL, Method & Decoding
   checkCode(easy_setopt(curl, OPT_URL, req.url.cstring), errBuf.cstring)
   checkCode(easy_setopt(curl, OPT_ACCEPT_ENCODING, req.acceptEncoding.cstring), errBuf.cstring)
+  checkCode(easy_setopt(curl, OPT_HTTP_CONTENT_DECODING, (if req.httpContentDecoding: 1.clong else: 0.clong)), errBuf.cstring)
+
+  if req.bufferSize > 0:
+    checkCode(easy_setopt(curl, OPT_BUFFERSIZE, req.bufferSize.clong), errBuf.cstring)
 
   let upperVerb = req.httpMethod.toUpperAscii()
   var mimeHandle: PCurlMime = nil
@@ -482,8 +831,13 @@ proc executeOnHandle(curl: PCurl, req: Request, resetFirst: bool): Response =
     # 6. Timeouts, Redirects, SSL, Proxy, Cookies
     if req.timeoutMs > 0:
       checkCode(easy_setopt(curl, OPT_TIMEOUT_MS, req.timeoutMs.clong), errBuf.cstring)
+    else:
+      checkCode(easy_setopt(curl, OPT_TIMEOUT_MS, 0.clong), errBuf.cstring)
     if req.connectTimeoutMs > 0:
       checkCode(easy_setopt(curl, OPT_CONNECTTIMEOUT_MS, req.connectTimeoutMs.clong), errBuf.cstring)
+    if req.lowSpeedLimit > 0 and req.lowSpeedTimeSec > 0:
+      checkCode(easy_setopt(curl, OPT_LOW_SPEED_LIMIT, req.lowSpeedLimit.clong), errBuf.cstring)
+      checkCode(easy_setopt(curl, OPT_LOW_SPEED_TIME, req.lowSpeedTimeSec.clong), errBuf.cstring)
 
     if req.followRedirects:
       let followMode = if req.safeRedirects: CURLFOLLOW_SAFE.clong else: CURLFOLLOW_ALL.clong
@@ -519,103 +873,73 @@ proc executeOnHandle(curl: PCurl, req: Request, resetFirst: bool): Response =
     if req.cookieJar.len > 0:
       checkCode(easy_setopt(curl, OPT_COOKIEJAR, req.cookieJar.cstring), errBuf.cstring)
 
-    # 7. Response body & header buffers
-    var bodyWrap, headerWrap: BufferWrap
-    checkCode(easy_setopt(curl, OPT_WRITEDATA, addr bodyWrap), errBuf.cstring)
-    checkCode(easy_setopt(curl, OPT_WRITEFUNCTION, writeCallback), errBuf.cstring)
-    checkCode(easy_setopt(curl, OPT_HEADERDATA, addr headerWrap), errBuf.cstring)
-    checkCode(easy_setopt(curl, OPT_HEADERFUNCTION, writeCallback), errBuf.cstring)
+    if streaming:
+      var streamCtx = StreamContext(
+        curl: curl,
+        followRedirects: req.followRedirects,
+        maxRedirects: req.maxRedirects,
+        headers: newHttpHeaders(),
+        onHeaders: onHeaders,
+        onChunk: onChunk,
+        onProgress: onProgress
+      )
+      checkCode(easy_setopt(curl, OPT_WRITEDATA, addr streamCtx), errBuf.cstring)
+      checkCode(easy_setopt(curl, OPT_WRITEFUNCTION, streamWriteCallback), errBuf.cstring)
+      checkCode(easy_setopt(curl, OPT_HEADERDATA, addr streamCtx), errBuf.cstring)
+      checkCode(easy_setopt(curl, OPT_HEADERFUNCTION, streamHeaderCallback), errBuf.cstring)
+      if onProgress != nil:
+        checkCode(easy_setopt(curl, OPT_XFERINFODATA, addr streamCtx), errBuf.cstring)
+        checkCode(easy_setopt(curl, OPT_XFERINFOFUNCTION, streamXferInfoCallback), errBuf.cstring)
+        checkCode(easy_setopt(curl, OPT_NOPROGRESS, 0.clong), errBuf.cstring)
+      else:
+        checkCode(easy_setopt(curl, OPT_NOPROGRESS, 1.clong), errBuf.cstring)
 
-    # 8. Perform request
-    let performRes = easy_perform(curl)
-    checkCode(performRes, errBuf.cstring)
+      let performRes = easy_perform(curl)
+      if streamCtx.abortedByCallback and performRes in [E_WRITE_ERROR, E_ABORTED_BY_CALLBACK]:
+        result.abortedByCallback = true
+      else:
+        checkCode(performRes, errBuf.cstring)
+        if not streamCtx.headersDelivered:
+          if not deliverHeadersIfNeeded(streamCtx):
+            result.abortedByCallback = true
 
-    # 9. Extract response metadata
-    result.body = move(bodyWrap.data)
-    result.headers = newHttpHeaders()
+      result.headers = streamCtx.headers
+      result.rawHeaderLines = move(streamCtx.rawHeaderLines)
+      populateResponseMetadata(curl, result)
+    else:
+      # 7. Response body & header buffers
+      var bodyWrap, headerWrap: BufferWrap
+      checkCode(easy_setopt(curl, OPT_WRITEDATA, addr bodyWrap), errBuf.cstring)
+      checkCode(easy_setopt(curl, OPT_WRITEFUNCTION, writeCallback), errBuf.cstring)
+      checkCode(easy_setopt(curl, OPT_HEADERDATA, addr headerWrap), errBuf.cstring)
+      checkCode(easy_setopt(curl, OPT_HEADERFUNCTION, writeCallback), errBuf.cstring)
 
-    # Parse headers from the final response block (in case of redirects or 100 Continue)
-    let rawHeaders = headerWrap.data
-    for line in rawHeaders.splitLines():
-      let stripped = line.strip()
-      if stripped.len == 0:
-        continue
-      result.rawHeaderLines.add(stripped)
-      if stripped.startsWith("HTTP/"):
-        # New HTTP response block (redirect hop or final response) -> clear previous hop headers
-        result.headers.clear()
-        continue
-      let colonPos = stripped.find(':')
-      if colonPos > 0:
-        let key = stripped[0 ..< colonPos].strip()
-        let val = stripped[colonPos + 1 .. ^1].strip()
-        result.headers.add(key, val)
+      # 8. Perform request
+      let performRes = easy_perform(curl)
+      checkCode(performRes, errBuf.cstring)
 
-    var respCode: clong = 0
-    if easy_getinfo(curl, INFO_RESPONSE_CODE, addr respCode) == E_OK:
-      result.statusCode = int(respCode)
+      # 9. Extract response metadata
+      result.body = move(bodyWrap.data)
+      result.headers = newHttpHeaders()
 
-    var effUrl: cstring = nil
-    if easy_getinfo(curl, INFO_EFFECTIVE_URL, addr effUrl) == E_OK and effUrl != nil:
-      result.url = $effUrl
+      # Parse headers from the final response block (in case of redirects or 100 Continue)
+      let rawHeaders = headerWrap.data
+      for line in rawHeaders.splitLines():
+        let stripped = line.strip()
+        if stripped.len == 0:
+          continue
+        result.rawHeaderLines.add(stripped)
+        if stripped.startsWith("HTTP/"):
+          # New HTTP response block (redirect hop or final response) -> clear previous hop headers
+          result.headers.clear()
+          continue
+        let colonPos = stripped.find(':')
+        if colonPos > 0:
+          let key = stripped[0 ..< colonPos].strip()
+          let val = stripped[colonPos + 1 .. ^1].strip()
+          result.headers.add(key, val)
 
-    var effMethod: cstring = nil
-    if easy_getinfo(curl, INFO_EFFECTIVE_METHOD, addr effMethod) == E_OK and effMethod != nil:
-      result.effectiveMethod = $effMethod
-
-    var httpVer: clong = 0
-    if easy_getinfo(curl, INFO_HTTP_VERSION, addr httpVer) == E_OK:
-      result.httpVersion = int(httpVer)
-
-    var ctype: cstring = nil
-    if easy_getinfo(curl, INFO_CONTENT_TYPE, addr ctype) == E_OK and ctype != nil:
-      result.contentType = $ctype
-
-    var primIp: cstring = nil
-    if easy_getinfo(curl, INFO_PRIMARY_IP, addr primIp) == E_OK and primIp != nil:
-      result.primaryIp = $primIp
-
-    var primPort: clong = 0
-    if easy_getinfo(curl, INFO_PRIMARY_PORT, addr primPort) == E_OK:
-      result.primaryPort = int(primPort)
-
-    discard easy_getinfo(curl, INFO_TOTAL_TIME, addr result.totalTime)
-    discard easy_getinfo(curl, INFO_NAMELOOKUP_TIME, addr result.namelookupTime)
-    discard easy_getinfo(curl, INFO_CONNECT_TIME, addr result.connectTime)
-    discard easy_getinfo(curl, INFO_APPCONNECT_TIME, addr result.appconnectTime)
-    discard easy_getinfo(curl, INFO_PRETRANSFER_TIME, addr result.pretransferTime)
-    discard easy_getinfo(curl, INFO_STARTTRANSFER_TIME, addr result.starttransferTime)
-    discard easy_getinfo(curl, INFO_REDIRECT_TIME, addr result.redirectTime)
-
-    var redirCount: clong = 0
-    if easy_getinfo(curl, INFO_REDIRECT_COUNT, addr redirCount) == E_OK:
-      result.redirectCount = int(redirCount)
-
-    # Extract curl-impersonate CURLINFO_REDIRECT_HISTORY
-    var redirSlist: Pslist = nil
-    if easy_getinfo(curl, INFO_REDIRECT_HISTORY, addr redirSlist) == E_OK and redirSlist != nil:
-      try:
-        for item in slistToSeq(redirSlist):
-          result.redirectHistory.add(parseRedirectHop(item))
-      finally:
-        slist_free_all(redirSlist)
-
-    # Extract CURLINFO_COOKIELIST
-    var cookieSlist: Pslist = nil
-    if easy_getinfo(curl, INFO_COOKIELIST, addr cookieSlist) == E_OK and cookieSlist != nil:
-      try:
-        result.cookies = slistToSeq(cookieSlist)
-      finally:
-        slist_free_all(cookieSlist)
-
-    # Extract curl-impersonate CURLINFO_COOKIECHANGES
-    var cookieChangesSlist: Pslist = nil
-    if easy_getinfo(curl, INFO_COOKIECHANGES, addr cookieChangesSlist) == E_OK and cookieChangesSlist != nil:
-      try:
-        for item in slistToSeq(cookieChangesSlist):
-          result.cookieChanges.add(parseCookieChange(item))
-      finally:
-        slist_free_all(cookieChangesSlist)
+      populateResponseMetadata(curl, result)
 
   finally:
     if headerSlist != nil:
@@ -623,6 +947,10 @@ proc executeOnHandle(curl: PCurl, req: Request, resetFirst: bool): Response =
     if mimeHandle != nil:
       mime_free(mimeHandle)
     discard easy_setopt(curl, OPT_ERRORBUFFER, nil)
+    if streaming:
+      discard easy_setopt(curl, OPT_NOPROGRESS, 1.clong)
+      discard easy_setopt(curl, OPT_XFERINFOFUNCTION, nil)
+      discard easy_setopt(curl, OPT_XFERINFODATA, nil)
 
 proc perform*(req: Request): Response =
   ## Executes a one-shot `Request` using a fresh `libcurl-impersonate` handle.
@@ -634,6 +962,54 @@ proc perform*(req: Request): Response =
     result = executeOnHandle(curl, req, resetFirst = false)
   finally:
     easy_cleanup(curl)
+
+proc performStreaming*(
+  req: Request,
+  onHeaders: OnHeadersCallback,
+  onChunk: OnChunkCallback,
+  onProgress: OnProgressCallback = nil
+): Response =
+  ## Executes a streaming `Request` without buffering the response body in memory.
+  ensureGlobalInit()
+  let curl = easy_init()
+  if curl == nil:
+    raise newException(CurlImpersonateError, "curl_easy_init returned nil")
+  try:
+    result = executeOnHandle(
+      curl,
+      req,
+      resetFirst = false,
+      streaming = true,
+      onHeaders = onHeaders,
+      onChunk = onChunk,
+      onProgress = onProgress
+    )
+  finally:
+    easy_cleanup(curl)
+
+proc requestStreaming*(
+  session: ImpersonateSession,
+  req: Request,
+  onHeaders: OnHeadersCallback,
+  onChunk: OnChunkCallback,
+  onProgress: OnProgressCallback = nil
+): Response =
+  ## Executes a streaming `Request` on an existing `ImpersonateSession`, preserving
+  ## pooled connections, cookies, TLS sessions, and shared `CURLSH*` state.
+  if session == nil or session.handle == nil:
+    raise newException(CurlImpersonateError, "ImpersonateSession is closed or nil")
+  var effectiveReq = req
+  if effectiveReq.share == nil:
+    effectiveReq.share = session.share
+  result = executeOnHandle(
+    session.handle,
+    effectiveReq,
+    resetFirst = true,
+    streaming = true,
+    onHeaders = onHeaders,
+    onChunk = onChunk,
+    onProgress = onProgress
+  )
 
 proc request*(
   session: ImpersonateSession,
@@ -662,12 +1038,17 @@ proc request*(
     body = body,
     timeoutMs = session.timeoutMs,
     connectTimeoutMs = session.connectTimeoutMs,
+    lowSpeedLimit = session.lowSpeedLimit,
+    lowSpeedTimeSec = session.lowSpeedTimeSec,
+    bufferSize = session.bufferSize,
+    httpContentDecoding = session.httpContentDecoding,
     followRedirects = session.followRedirects,
     safeRedirects = session.safeRedirects,
     maxRedirects = session.maxRedirects,
     verifySsl = session.verifySsl,
     proxy = session.proxy,
-    httpVersion = session.httpVersion
+    httpVersion = session.httpVersion,
+    share = session.share
   )
   req.mimeParts = @mimeParts
   req.cookieFile = session.cookieFile

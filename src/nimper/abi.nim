@@ -17,7 +17,7 @@ const
 
 when defined(windows):
   const
-    defaultLibName = "libcurl-impersonate(|-chrome|-ff).dll|libcurl.dll"
+    defaultLibName = "(libcurl-impersonate|libcurl-impersonate-chrome|libcurl-impersonate-ff|libcurl).dll"
 elif defined(macosx):
   const
     defaultLibName = "(" & homeLibDir & "|/opt/homebrew/lib/|/usr/local/lib/|)(libcurl-impersonate(|-chrome|-ff)|libcurl)(|.4).dylib"
